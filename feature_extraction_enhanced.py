@@ -27,7 +27,7 @@ import pandas as pd
 import os
 import re
 import warnings
-from scipy.signal import hilbert, butter, filtfilt
+from scipy.signal import hilbert, butter, filtfilt, bilinear
 from scipy.fftpack import dct
 
 warnings.filterwarnings("ignore")
@@ -644,8 +644,56 @@ def _ext_extract_voice_quality(sound, audio, sr):
     except Exception:
         pass
 
-    # VOT requires phone-level alignment; left as NaN by design.
+    # --- VOT (approximate, no phone-level alignment) ---
+    try:
+        vot_mean, vot_std = _ext_estimate_vot(sound, audio, sr)
+        features["vot_mean"] = vot_mean
+        features["vot_std"] = vot_std
+    except Exception:
+        pass
+
     return features
+
+
+def _ext_estimate_vot(sound, audio, sr):
+    """Rough VOT estimate: time from onset burst to first voiced frame.
+
+    Real VOT needs phone-level alignment. This proxy uses librosa onset
+    detection and parselmouth pitch to measure the gap between each
+    energy onset and the next voicing start. Values outside 5-200 ms are
+    discarded as they cannot plausibly be stop-release VOTs.
+    """
+    try:
+        pitch = call(sound, "To Pitch", 0.0, 75, 500)
+    except Exception:
+        return np.nan, np.nan
+    pv = pitch.selected_array["frequency"]
+    if pv.size == 0:
+        return np.nan, np.nan
+    times = np.arange(len(pv)) * pitch.dx + pitch.xmin
+
+    try:
+        onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
+        onset_times = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=sr, units="time"
+        )
+    except Exception:
+        return np.nan, np.nan
+    if len(onset_times) == 0:
+        return np.nan, np.nan
+
+    vots = []
+    for t in onset_times:
+        mask = (times >= t) & (pv > 0)
+        if not np.any(mask):
+            continue
+        voiced_t = times[np.argmax(mask)]
+        vot = float(voiced_t - t)
+        if 0.005 <= vot <= 0.2:
+            vots.append(vot)
+    if not vots:
+        return np.nan, np.nan
+    return _ext_safe_float(np.mean(vots)), _ext_safe_float(np.std(vots))
 
 
 # -------- Prosody / rhythm --------
@@ -936,6 +984,249 @@ def _ext_lempel_ziv(x):
     return _ext_safe_float(c * np.log2(n) / n)
 
 
+def _ext_sample_entropy(x, m=2, r=None):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < m + 2:
+        return np.nan
+    if r is None:
+        r = 0.2 * float(np.std(x))
+    if r <= 0:
+        return np.nan
+    patterns_m = np.array([x[i:i + m] for i in range(N - m)])
+    patterns_m1 = np.array([x[i:i + m + 1] for i in range(N - m)])
+    B = 0
+    A = 0
+    for i in range(len(patterns_m)):
+        dm = np.max(np.abs(patterns_m - patterns_m[i]), axis=1)
+        dm1 = np.max(np.abs(patterns_m1 - patterns_m1[i]), axis=1)
+        B += int(np.sum(dm <= r)) - 1
+        A += int(np.sum(dm1 <= r)) - 1
+    if B <= 0 or A <= 0:
+        return np.nan
+    return _ext_safe_float(-np.log(A / B))
+
+
+def _ext_approximate_entropy(x, m=2, r=None):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < m + 2:
+        return np.nan
+    if r is None:
+        r = 0.2 * float(np.std(x))
+    if r <= 0:
+        return np.nan
+
+    def _phi(mm):
+        pats = np.array([x[i:i + mm] for i in range(N - mm + 1)])
+        n = len(pats)
+        C = np.zeros(n)
+        for i in range(n):
+            d = np.max(np.abs(pats - pats[i]), axis=1)
+            C[i] = np.sum(d <= r) / n
+        return float(np.mean(np.log(C + 1e-12)))
+
+    return _ext_safe_float(_phi(m) - _phi(m + 1))
+
+
+def _ext_permutation_entropy(x, order=3, normalize=True):
+    from itertools import permutations
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < order + 1:
+        return np.nan
+    perms = list(permutations(range(order)))
+    perm_idx = {p: i for i, p in enumerate(perms)}
+    counts = np.zeros(len(perms))
+    for i in range(N - order + 1):
+        window = x[i:i + order]
+        pattern = tuple(np.argsort(window, kind="mergesort"))
+        counts[perm_idx[pattern]] += 1
+    total = counts.sum()
+    if total == 0:
+        return np.nan
+    p = counts[counts > 0] / total
+    pe = -float(np.sum(p * np.log2(p)))
+    if normalize:
+        pe /= np.log2(len(perms))
+    return _ext_safe_float(pe)
+
+
+def _ext_higuchi_fd(x, kmax=10):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < 2 * kmax + 1:
+        return np.nan
+    Lk = []
+    for k in range(1, kmax + 1):
+        Lm = []
+        for m in range(k):
+            n_max = (N - m - 1) // k
+            if n_max < 1:
+                continue
+            idx = m + np.arange(0, n_max + 1) * k
+            seg = x[idx]
+            Lmk = float(np.sum(np.abs(np.diff(seg))))
+            norm = (N - 1) / (n_max * k)
+            Lm.append((Lmk * norm) / k)
+        if not Lm:
+            return np.nan
+        Lk.append(float(np.mean(Lm)))
+    Lk = np.array(Lk)
+    if np.any(Lk <= 0):
+        return np.nan
+    log_k = np.log(1.0 / np.arange(1, kmax + 1))
+    slope, _ = np.polyfit(log_k, np.log(Lk), 1)
+    return _ext_safe_float(slope)
+
+
+def _ext_katz_fd(x):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < 2:
+        return np.nan
+    diffs = np.diff(x)
+    step = np.sqrt(1.0 + diffs ** 2)
+    L = float(np.sum(step))
+    if L <= 0:
+        return np.nan
+    dist = np.sqrt(np.arange(1, N) ** 2 + (x[1:] - x[0]) ** 2)
+    d = float(np.max(dist))
+    a = L / (N - 1)
+    if a <= 0 or d <= 0:
+        return np.nan
+    n = L / a
+    denom = np.log10(n) + np.log10(d / L)
+    if denom == 0:
+        return np.nan
+    return _ext_safe_float(np.log10(n) / denom)
+
+
+def _ext_hurst_rs(x):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < 32:
+        return np.nan
+    ns = np.unique(np.floor(np.logspace(np.log10(8), np.log10(N // 4), 8)).astype(int))
+    rs_means = []
+    ns_used = []
+    for n in ns:
+        segs = N // n
+        if segs < 1:
+            continue
+        rs_vals = []
+        for i in range(segs):
+            seg = x[i * n:(i + 1) * n]
+            s = float(np.std(seg))
+            if s <= 0:
+                continue
+            y = seg - np.mean(seg)
+            z = np.cumsum(y)
+            rs_vals.append((float(np.max(z)) - float(np.min(z))) / s)
+        if rs_vals:
+            rs_means.append(float(np.mean(rs_vals)))
+            ns_used.append(n)
+    if len(rs_means) < 4:
+        return np.nan
+    slope, _ = np.polyfit(np.log(ns_used), np.log(rs_means), 1)
+    return _ext_safe_float(slope)
+
+
+def _ext_dfa(x, min_window=8):
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+    if N < 32:
+        return np.nan
+    y = np.cumsum(x - np.mean(x))
+    max_window = N // 4
+    if max_window <= min_window:
+        return np.nan
+    windows = np.unique(
+        np.floor(np.logspace(np.log10(min_window), np.log10(max_window), 10)).astype(int)
+    )
+    F = []
+    ws = []
+    for w in windows:
+        segs = N // w
+        if segs < 1:
+            continue
+        rms = []
+        t = np.arange(w)
+        for i in range(segs):
+            seg = y[i * w:(i + 1) * w]
+            p = np.polyfit(t, seg, 1)
+            fit = np.polyval(p, t)
+            rms.append(float(np.mean((seg - fit) ** 2)))
+        if rms:
+            F.append(np.sqrt(np.mean(rms)))
+            ws.append(w)
+    if len(F) < 4:
+        return np.nan
+    slope, _ = np.polyfit(np.log(ws), np.log(F), 1)
+    return _ext_safe_float(slope)
+
+
+def _ext_corr_dim(x, emb_dim=5, max_points=500):
+    x = np.asarray(x, dtype=float)
+    M = len(x) - emb_dim + 1
+    if M < 50:
+        return np.nan
+    embed = np.array([x[i:i + emb_dim] for i in range(M)])
+    if M > max_points:
+        idx = np.linspace(0, M - 1, max_points).astype(int)
+        embed = embed[idx]
+    d = np.sqrt(np.sum((embed[:, None, :] - embed[None, :, :]) ** 2, axis=-1))
+    d = d[np.triu_indices(len(embed), k=1)]
+    d = d[d > 0]
+    if d.size < 10:
+        return np.nan
+    r_lo, r_hi = np.percentile(d, [5, 95])
+    if r_lo <= 0 or r_hi <= r_lo:
+        return np.nan
+    radii = np.logspace(np.log10(r_lo), np.log10(r_hi), 12)
+    C = np.array([float(np.sum(d <= r)) for r in radii]) / len(d)
+    valid = C > 0
+    if valid.sum() < 4:
+        return np.nan
+    slope, _ = np.polyfit(np.log(radii[valid]), np.log(C[valid]), 1)
+    return _ext_safe_float(slope)
+
+
+def _ext_lyapunov_max(x, emb_dim=5, lag=1, max_iter=30, min_tsep=None):
+    x = np.asarray(x, dtype=float)
+    M = len(x) - (emb_dim - 1) * lag
+    if M < 60:
+        return np.nan
+    embed = np.array([x[i:i + emb_dim * lag:lag] for i in range(M)])
+    if min_tsep is None:
+        min_tsep = max(10, emb_dim)
+    d2 = np.sum((embed[:, None, :] - embed[None, :, :]) ** 2, axis=-1)
+    tidx = np.arange(M)
+    time_mask = np.abs(tidx[:, None] - tidx[None, :]) <= min_tsep
+    d2[time_mask] = np.inf
+    if not np.any(np.isfinite(d2)):
+        return np.nan
+    nn = np.argmin(d2, axis=1)
+    log_d = np.zeros(max_iter)
+    cnt = np.zeros(max_iter)
+    for i in range(M):
+        j = nn[i]
+        for k in range(max_iter):
+            if i + k >= M or j + k >= M:
+                break
+            dij = float(np.linalg.norm(embed[i + k] - embed[j + k]))
+            if dij > 0:
+                log_d[k] += np.log(dij)
+                cnt[k] += 1
+    valid = cnt >= max(3, M // 20)
+    if valid.sum() < 5:
+        return np.nan
+    avg = log_d[valid] / cnt[valid]
+    k_vals = np.arange(max_iter)[valid]
+    slope, _ = np.polyfit(k_vals, avg, 1)
+    return _ext_safe_float(slope)
+
+
 def _ext_extract_nonlinear(audio, sr, pitch_vals=None):
     features = _ext_nan_dict(_NONLINEAR_EXT_KEYS)
 
@@ -948,56 +1239,136 @@ def _ext_extract_nonlinear(audio, sr, pitch_vals=None):
     except Exception:
         pass
 
+    # dfa: prefer nolds, else pure-python
+    dfa_val = np.nan
     if _HAS_NOLDS:
         try:
-            features["dfa"] = _ext_safe_float(nolds.dfa(sig_ds))
+            dfa_val = _ext_safe_float(nolds.dfa(sig_ds))
         except Exception:
             pass
+    if not np.isfinite(dfa_val):
         try:
-            features["correlation_dimension_d2"] = _ext_safe_float(
-                nolds.corr_dim(sig_ds[:1000], emb_dim=5)
-            )
+            dfa_val = _ext_dfa(sig_ds)
         except Exception:
             pass
-        try:
-            features["hurst_exponent"] = _ext_safe_float(nolds.hurst_rs(sig_ds))
-        except Exception:
-            pass
-        try:
-            features["lyapunov_exponent_max"] = _ext_safe_float(
-                nolds.lyap_r(sig_ds[:1000], emb_dim=5)
-            )
-        except Exception:
-            pass
+    features["dfa"] = dfa_val
 
+    # correlation dimension
+    cd_val = np.nan
+    if _HAS_NOLDS:
+        try:
+            cd_val = _ext_safe_float(nolds.corr_dim(sig_ds[:1000], emb_dim=5))
+        except Exception:
+            pass
+    if not np.isfinite(cd_val):
+        try:
+            cd_val = _ext_corr_dim(sig_ds[:1000], emb_dim=5)
+        except Exception:
+            pass
+    features["correlation_dimension_d2"] = cd_val
+
+    # hurst
+    h_val = np.nan
+    if _HAS_NOLDS:
+        try:
+            h_val = _ext_safe_float(nolds.hurst_rs(sig_ds))
+        except Exception:
+            pass
+    if not np.isfinite(h_val):
+        try:
+            h_val = _ext_hurst_rs(sig_ds)
+        except Exception:
+            pass
+    features["hurst_exponent"] = h_val
+
+    # lyapunov
+    ly_val = np.nan
+    if _HAS_NOLDS:
+        try:
+            ly_val = _ext_safe_float(nolds.lyap_r(sig_ds[:1000], emb_dim=5))
+        except Exception:
+            pass
+    if not np.isfinite(ly_val):
+        try:
+            ly_val = _ext_lyapunov_max(sig_ds[:1000], emb_dim=5)
+        except Exception:
+            pass
+    features["lyapunov_exponent_max"] = ly_val
+
+    # sample entropy
+    se_val = np.nan
     if _HAS_ANTROPY:
         try:
-            features["sample_entropy"] = _ext_safe_float(antropy.sample_entropy(sig_ds))
+            se_val = _ext_safe_float(antropy.sample_entropy(sig_ds))
         except Exception:
             pass
+    if not np.isfinite(se_val) and _HAS_NOLDS:
         try:
-            features["approximate_entropy"] = _ext_safe_float(antropy.app_entropy(sig_ds))
+            se_val = _ext_safe_float(nolds.sampen(sig_ds))
         except Exception:
             pass
+    if not np.isfinite(se_val):
         try:
-            features["permutation_entropy"] = _ext_safe_float(
-                antropy.perm_entropy(sig_ds, order=3, normalize=True)
-            )
+            se_val = _ext_sample_entropy(sig_ds[:2000])
         except Exception:
             pass
+    features["sample_entropy"] = se_val
+
+    # approximate entropy
+    ae_val = np.nan
+    if _HAS_ANTROPY:
         try:
-            features["higuchi_fractal_dim"] = _ext_safe_float(antropy.higuchi_fd(sig_ds))
+            ae_val = _ext_safe_float(antropy.app_entropy(sig_ds))
         except Exception:
             pass
+    if not np.isfinite(ae_val):
         try:
-            features["katz_fractal_dim"] = _ext_safe_float(antropy.katz_fd(sig_ds))
+            ae_val = _ext_approximate_entropy(sig_ds[:2000])
         except Exception:
             pass
-    elif _HAS_NOLDS:
+    features["approximate_entropy"] = ae_val
+
+    # permutation entropy
+    pe_val = np.nan
+    if _HAS_ANTROPY:
         try:
-            features["sample_entropy"] = _ext_safe_float(nolds.sampen(sig_ds))
+            pe_val = _ext_safe_float(antropy.perm_entropy(sig_ds, order=3, normalize=True))
         except Exception:
             pass
+    if not np.isfinite(pe_val):
+        try:
+            pe_val = _ext_permutation_entropy(sig_ds, order=3, normalize=True)
+        except Exception:
+            pass
+    features["permutation_entropy"] = pe_val
+
+    # higuchi fd
+    hfd_val = np.nan
+    if _HAS_ANTROPY:
+        try:
+            hfd_val = _ext_safe_float(antropy.higuchi_fd(sig_ds))
+        except Exception:
+            pass
+    if not np.isfinite(hfd_val):
+        try:
+            hfd_val = _ext_higuchi_fd(sig_ds)
+        except Exception:
+            pass
+    features["higuchi_fractal_dim"] = hfd_val
+
+    # katz fd
+    kfd_val = np.nan
+    if _HAS_ANTROPY:
+        try:
+            kfd_val = _ext_safe_float(antropy.katz_fd(sig_ds))
+        except Exception:
+            pass
+    if not np.isfinite(kfd_val):
+        try:
+            kfd_val = _ext_katz_fd(sig_ds)
+        except Exception:
+            pass
+    features["katz_fractal_dim"] = kfd_val
 
     try:
         features["lempel_ziv_complexity"] = _ext_lempel_ziv(sig_ds)
@@ -1032,23 +1403,239 @@ def _ext_extract_nonlinear(audio, sr, pitch_vals=None):
 
 
 # -------- eGeMAPS (openSMILE) --------
-def _ext_extract_egemaps(wav_path):
-    features = _ext_nan_dict(_EGEMAPS_EXT_KEYS)
-    if not _HAS_OPENSMILE or wav_path is None:
-        return features
+def _ext_a_weighting_biquads(sr):
+    """Standard A-weighting filter via bilinear transform of analog prototype."""
+    f1, f2, f3, f4 = 20.598997, 107.65265, 737.86223, 12194.217
+    A1000 = 1.9997
+    nums = [(2 * np.pi * f4) ** 2 * (10 ** (A1000 / 20.0)), 0, 0, 0, 0]
+    dens = np.polymul(
+        [1, 4 * np.pi * f4, (2 * np.pi * f4) ** 2],
+        [1, 4 * np.pi * f1, (2 * np.pi * f1) ** 2],
+    )
+    dens = np.polymul(np.polymul(dens, [1, 2 * np.pi * f3]), [1, 2 * np.pi * f2])
+    b, a = bilinear(nums, dens, sr)
+    return b, a
+
+
+def _ext_loudness_contour(audio, sr, frame_ms=25, hop_ms=10):
+    """Approximate perceptual loudness (sone-like) via A-weighted RMS."""
     try:
-        smile = _ext_get_opensmile()
-        if smile is None:
-            return features
-        df = smile.process_file(str(wav_path))
-        if len(df) == 0:
-            return features
-        row = df.iloc[0]
-        for src_name, dst_name in _EGEMAPS_NAME_MAP.items():
-            if src_name in row.index:
-                features[dst_name] = _ext_safe_float(row[src_name])
+        b, a = _ext_a_weighting_biquads(sr)
+        aw = filtfilt(b, a, audio)
+    except Exception:
+        aw = audio
+    n = int(frame_ms * sr / 1000)
+    hop = int(hop_ms * sr / 1000)
+    if n <= 0 or hop <= 0 or len(aw) < n:
+        return np.array([]), hop_ms / 1000.0
+    rms_vals = []
+    for i in range(0, len(aw) - n, hop):
+        frame = aw[i:i + n]
+        rms_vals.append(float(np.sqrt(np.mean(frame ** 2))))
+    rms_arr = np.asarray(rms_vals)
+    # Stevens' power-law loudness on intensity (I = rms^2), exponent 0.3.
+    # Keeps perceptual ordering without needing acoustic calibration.
+    loudness = np.power(rms_arr ** 2 + 1e-12, 0.3)
+    return loudness, hop_ms / 1000.0
+
+
+def _ext_count_peaks(x, min_distance=5):
+    if x.size < 3:
+        return 0
+    peaks = []
+    last = -min_distance
+    mean = float(np.mean(x))
+    for i in range(1, len(x) - 1):
+        if x[i] > x[i - 1] and x[i] > x[i + 1] and x[i] > mean and (i - last) >= min_distance:
+            peaks.append(i)
+            last = i
+    return len(peaks)
+
+
+def _ext_pitch_semitones(sound):
+    try:
+        pitch = call(sound, "To Pitch", 0.0, 75, 500)
+    except Exception:
+        return np.array([]), np.array([]), 0.0, np.array([])
+    pv = pitch.selected_array["frequency"]
+    dx = float(pitch.dx)
+    voiced_mask = pv > 0
+    voiced_vals = pv[voiced_mask]
+    if voiced_vals.size == 0:
+        return np.array([]), np.array([]), dx, voiced_mask
+    # Semitones re 27.5 Hz (eGeMAPS convention)
+    st = 12.0 * np.log2(voiced_vals / 27.5)
+    return st, voiced_vals, dx, voiced_mask
+
+
+def _ext_rising_falling_slopes(contour, dx):
+    if contour.size < 3 or dx <= 0:
+        return np.nan, np.nan
+    diffs = np.diff(contour)
+    rising, falling = [], []
+    run_sign = 0
+    run_start = 0
+    for i, d in enumerate(diffs):
+        sign = 1 if d > 0 else (-1 if d < 0 else 0)
+        if sign != run_sign and run_sign != 0:
+            if i - run_start >= 2:
+                slope = (contour[i] - contour[run_start]) / ((i - run_start) * dx)
+                (rising if run_sign > 0 else falling).append(slope)
+            run_start = i
+        if sign != 0:
+            run_sign = sign
+    if len(diffs) - run_start >= 2 and run_sign != 0:
+        slope = (contour[-1] - contour[run_start]) / ((len(diffs) - run_start) * dx)
+        (rising if run_sign > 0 else falling).append(slope)
+    r_mean = float(np.mean(rising)) if rising else np.nan
+    f_mean = float(np.mean(falling)) if falling else np.nan
+    return _ext_safe_float(r_mean), _ext_safe_float(f_mean)
+
+
+def _ext_voiced_segments_per_sec(sound, duration):
+    try:
+        pitch = call(sound, "To Pitch", 0.0, 75, 500)
+    except Exception:
+        return np.nan
+    pv = pitch.selected_array["frequency"]
+    if pv.size == 0 or duration <= 0:
+        return np.nan
+    voiced = pv > 0
+    count = 0
+    prev = False
+    for v in voiced:
+        if v and not prev:
+            count += 1
+        prev = bool(v)
+    return _ext_safe_float(count / duration)
+
+
+def _ext_hammarberg_alpha_per_frame(audio, sr, frame_ms=40, hop_ms=20):
+    """Compute Hammarberg index and alpha ratio per voiced frame."""
+    n = int(frame_ms * sr / 1000)
+    hop = int(hop_ms * sr / 1000)
+    if n <= 0 or hop <= 0 or len(audio) < n:
+        return np.array([]), np.array([])
+    window = np.hanning(n)
+    ham_vals = []
+    alpha_vals = []
+    for i in range(0, len(audio) - n, hop):
+        frame = audio[i:i + n] * window
+        rms = float(np.sqrt(np.mean(frame ** 2)))
+        if rms < 1e-4:
+            continue
+        spec = np.abs(np.fft.rfft(frame))
+        freqs = np.fft.rfftfreq(n, 1.0 / sr)
+        low_mask = (freqs >= 0) & (freqs <= 2000)
+        high_mask = (freqs > 2000) & (freqs <= min(5000, sr / 2))
+        if not np.any(low_mask) or not np.any(high_mask):
+            continue
+        peak_low = float(np.max(spec[low_mask]))
+        peak_high = float(np.max(spec[high_mask]))
+        if peak_low > 0 and peak_high > 0:
+            ham_vals.append(20.0 * np.log10(peak_low / peak_high))
+        alpha_low_mask = (freqs >= 50) & (freqs <= 1000)
+        alpha_high_mask = (freqs > 1000) & (freqs <= min(5000, sr / 2))
+        e_low = float(np.sum(spec[alpha_low_mask] ** 2))
+        e_high = float(np.sum(spec[alpha_high_mask] ** 2))
+        if e_low > 0 and e_high > 0:
+            alpha_vals.append(10.0 * np.log10(e_high / e_low))
+    return np.asarray(ham_vals), np.asarray(alpha_vals)
+
+
+def _ext_extract_egemaps_native(sound, audio, sr):
+    """Pure-python fallback for a subset of eGeMAPS functionals."""
+    features = _ext_nan_dict(_EGEMAPS_EXT_KEYS)
+    try:
+        duration = float(librosa.get_duration(y=audio, sr=sr))
+    except Exception:
+        duration = len(audio) / float(sr) if sr > 0 else 0.0
+
+    try:
+        loud, hop_s = _ext_loudness_contour(audio, sr)
+        if loud.size:
+            features["loudness_mean"] = _ext_safe_float(np.mean(loud))
+            mean_val = float(np.mean(loud))
+            features["loudness_std"] = _ext_safe_float(
+                np.std(loud) / mean_val if mean_val > 0 else np.std(loud)
+            )
+            features["loudness_percentile20"] = _ext_safe_float(np.percentile(loud, 20))
+            features["loudness_percentile50"] = _ext_safe_float(np.percentile(loud, 50))
+            features["loudness_percentile80"] = _ext_safe_float(np.percentile(loud, 80))
+            if duration > 0:
+                peaks = _ext_count_peaks(loud, min_distance=int(0.05 / hop_s))
+                features["loudness_peaks_per_sec"] = _ext_safe_float(peaks / duration)
     except Exception:
         pass
+
+    try:
+        st, _, dx, _ = _ext_pitch_semitones(sound)
+        if st.size:
+            features["f0_semitone_range"] = _ext_safe_float(
+                np.percentile(st, 80) - np.percentile(st, 20)
+            )
+            r_slope, f_slope = _ext_rising_falling_slopes(st, dx)
+            features["f0_semitone_mean_rising_slope"] = r_slope
+            features["f0_semitone_mean_falling_slope"] = f_slope
+    except Exception:
+        pass
+
+    try:
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        if rms > 0:
+            features["equivalent_sound_level_dbp"] = _ext_safe_float(20.0 * np.log10(rms))
+    except Exception:
+        pass
+
+    try:
+        ham, alpha = _ext_hammarberg_alpha_per_frame(audio, sr)
+        if ham.size:
+            ham_mean = float(np.mean(ham))
+            features["hammarberg_index_mean"] = _ext_safe_float(ham_mean)
+            features["hammarberg_index_std"] = _ext_safe_float(
+                np.std(ham) / abs(ham_mean) if abs(ham_mean) > 1e-6 else np.std(ham)
+            )
+        if alpha.size:
+            alpha_mean = float(np.mean(alpha))
+            features["alpha_ratio_mean"] = _ext_safe_float(alpha_mean)
+            features["alpha_ratio_std"] = _ext_safe_float(
+                np.std(alpha) / abs(alpha_mean) if abs(alpha_mean) > 1e-6 else np.std(alpha)
+            )
+    except Exception:
+        pass
+
+    try:
+        features["voiced_segments_per_sec"] = _ext_voiced_segments_per_sec(sound, duration)
+    except Exception:
+        pass
+
+    return features
+
+
+def _ext_extract_egemaps(sound, audio, sr, wav_path):
+    features = _ext_nan_dict(_EGEMAPS_EXT_KEYS)
+    used_opensmile = False
+    if _HAS_OPENSMILE and wav_path is not None:
+        try:
+            smile = _ext_get_opensmile()
+            if smile is not None:
+                df = smile.process_file(str(wav_path))
+                if len(df) > 0:
+                    row = df.iloc[0]
+                    for src_name, dst_name in _EGEMAPS_NAME_MAP.items():
+                        if src_name in row.index:
+                            features[dst_name] = _ext_safe_float(row[src_name])
+                    used_opensmile = True
+        except Exception:
+            pass
+
+    if not used_opensmile or any(
+        not np.isfinite(features.get(k, np.nan)) for k in _EGEMAPS_EXT_KEYS
+    ):
+        native = _ext_extract_egemaps_native(sound, audio, sr)
+        for k in _EGEMAPS_EXT_KEYS:
+            if not np.isfinite(features.get(k, np.nan)):
+                features[k] = native.get(k, np.nan)
     return features
 
 
@@ -1086,7 +1673,7 @@ def extract_extended_features(sound, audio, sr, wav_path=None):
         pass
 
     try:
-        features.update(_ext_extract_egemaps(wav_path))
+        features.update(_ext_extract_egemaps(sound, audio, sr, wav_path))
     except Exception:
         pass
 
