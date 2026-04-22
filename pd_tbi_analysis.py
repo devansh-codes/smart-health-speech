@@ -26,7 +26,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
@@ -222,183 +222,224 @@ X_tsne = tsne.fit_transform(X_tsne_input)
 scatter_2d(X_tsne, "t-SNE  (PD=red · TBI=blue)", "plot_tsne.png")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PART 3 – Machine-learning pipeline
+# PART 3 – Machine-learning pipeline  (Group-Based Splits, No Data Leakage)
 # ─────────────────────────────────────────────────────────────────────────────
-print("\n── Part 3: Machine Learning Pipeline ──")
+# Groups are patient IDs — GroupShuffleSplit guarantees that every recording
+# from a given patient lands exclusively in train OR test, never both.
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n── Part 3: Machine Learning Pipeline (Group-Based Validation) ──")
 
-cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+PATIENT_ID_COL = "patient_id"
+groups = df[PATIENT_ID_COL].values
+print(f"  Unique patients  : {df[PATIENT_ID_COL].nunique()}")
+print(f"  Total recordings : {len(df)}")
 
-MODELS = {
-    "Logistic Regression": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=2000, C=1.0, random_state=42)),
-    ]),
-    "Decision Tree": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", DecisionTreeClassifier(max_depth=5, random_state=42)),
-    ]),
-    "Random Forest": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)),
-    ]),
-    "LDA": Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LinearDiscriminantAnalysis()),
-    ]),
-}
-
-leaderboard_rows = []
-roc_fig, roc_ax   = plt.subplots(figsize=(8, 6))
-pr_fig,  pr_ax    = plt.subplots(figsize=(8, 6))
 COLORS_ML = ["#e63946", "#457b9d", "#2a9d8f", "#e9c46a"]
 
-for (name, model), col in zip(MODELS.items(), COLORS_ML):
-    print(f"  Training {name} …")
-
-    # ── collect fold-level metrics ──────────────────────────────────────
-    fold_acc, fold_prec, fold_rec, fold_f1, fold_auc = [], [], [], [], []
-
-    y_prob_all = np.zeros(len(y))
-    y_pred_all = np.zeros(len(y), dtype=int)
-
-    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
-        X_tr, X_val = X[train_idx], X[val_idx]
-        y_tr, y_val = y[train_idx], y[val_idx]
-
-        model.fit(X_tr, y_tr)
-        y_pred = model.predict(X_val)
-        y_prob = model.predict_proba(X_val)[:, 1]
-
-        y_pred_all[val_idx] = y_pred
-        y_prob_all[val_idx] = y_prob
-
-        fold_acc.append(accuracy_score(y_val, y_pred))
-        fold_prec.append(precision_score(y_val, y_pred, zero_division=0))
-        fold_rec.append(recall_score(y_val, y_pred, zero_division=0))
-        fold_f1.append(f1_score(y_val, y_pred, zero_division=0))
-        fold_auc.append(roc_auc_score(y_val, y_prob))
-
-    # ── aggregate ────────────────────────────────────────────────────────
-    row = {
-        "Model":         name,
-        "Accuracy":      f"{np.mean(fold_acc):.3f} ± {np.std(fold_acc):.3f}",
-        "Precision":     f"{np.mean(fold_prec):.3f} ± {np.std(fold_prec):.3f}",
-        "Recall":        f"{np.mean(fold_rec):.3f} ± {np.std(fold_rec):.3f}",
-        "F1-Score":      f"{np.mean(fold_f1):.3f} ± {np.std(fold_f1):.3f}",
-        "ROC-AUC":       f"{np.mean(fold_auc):.3f} ± {np.std(fold_auc):.3f}",
-        # raw for sorting
-        "_acc":  np.mean(fold_acc),
-        "_f1":   np.mean(fold_f1),
-        "_auc":  np.mean(fold_auc),
+def make_models():
+    return {
+        "Logistic Regression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=2000, C=1.0,
+                                       class_weight="balanced", random_state=42)),
+        ]),
+        "Decision Tree": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", DecisionTreeClassifier(max_depth=5,
+                                           class_weight="balanced", random_state=42)),
+        ]),
+        "Random Forest": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", RandomForestClassifier(n_estimators=200, class_weight="balanced",
+                                           random_state=42, n_jobs=-1)),
+        ]),
+        "LDA": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LinearDiscriminantAnalysis()),
+        ]),
     }
-    leaderboard_rows.append(row)
-    print(f"    Acc={row['Accuracy']}  F1={row['F1-Score']}  AUC={row['ROC-AUC']}")
 
-    # ── ROC curve (pooled OOF) ────────────────────────────────────────────
-    fpr, tpr, _ = roc_curve(y, y_prob_all)
-    auc_val = roc_auc_score(y, y_prob_all)
-    roc_ax.plot(fpr, tpr, color=col, linewidth=2, label=f"{name} (AUC={auc_val:.3f})")
+SPLIT_SCENARIOS = [("70:30", 0.30), ("80:20", 0.20)]
 
-    # ── Precision-Recall curve (pooled OOF) ──────────────────────────────
-    prec_c, rec_c, _ = precision_recall_curve(y, y_prob_all)
-    ap = average_precision_score(y, y_prob_all)
-    pr_ax.plot(rec_c, prec_c, color=col, linewidth=2, label=f"{name} (AP={ap:.3f})")
+all_results = {}   # {split_label: {model_name: {metric: float}}}
 
-    # ── Confusion matrix ──────────────────────────────────────────────────
-    cm = confusion_matrix(y, y_pred_all)
-    fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax_cm,
-                xticklabels=["TBI (pred)", "PD (pred)"],
-                yticklabels=["TBI (true)", "PD (true)"])
-    ax_cm.set_title(f"Confusion Matrix – {name}")
+for split_label, test_size in SPLIT_SCENARIOS:
+    tag = split_label.replace(":", "_")
+    print(f"\n{'─'*60}")
+    print(f"  Split: {split_label}  "
+          f"(train ≈ {1 - test_size:.0%} / test ≈ {test_size:.0%})")
+    print(f"{'─'*60}")
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+    train_idx, test_idx = next(gss.split(X, y, groups))
+
+    # Strict no-overlap verification — any overlap means data leakage
+    train_patients = set(groups[train_idx])
+    test_patients  = set(groups[test_idx])
+    overlap = train_patients & test_patients
+    assert len(overlap) == 0, f"Data leakage! Overlapping patients: {overlap}"
+    print(f"  Train patients: {len(train_patients)}  |  "
+          f"Test patients: {len(test_patients)}  |  Overlap: 0 ✓")
+    print(f"  Train samples : {len(train_idx)}       |  "
+          f"Test samples : {len(test_idx)}")
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    models       = make_models()
+    split_results = {}
+    roc_data     = {}
+    pr_data      = {}
+
+    for name, model in models.items():
+        print(f"  Training {name} …")
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+
+        metrics = {
+            "Accuracy":  accuracy_score(y_test, y_pred),
+            "Precision": precision_score(y_test, y_pred, zero_division=0),
+            "Recall":    recall_score(y_test, y_pred, zero_division=0),
+            "F1-Score":  f1_score(y_test, y_pred, zero_division=0),
+            "AUC-ROC":   roc_auc_score(y_test, y_prob),
+        }
+        split_results[name] = metrics
+        print(f"    Acc={metrics['Accuracy']:.3f}  "
+              f"F1={metrics['F1-Score']:.3f}  "
+              f"AUC={metrics['AUC-ROC']:.3f}")
+
+        fpr, tpr, _ = roc_curve(y_test, y_prob)
+        roc_data[name] = (fpr, tpr, metrics["AUC-ROC"])
+
+        prec_arr, rec_arr, _ = precision_recall_curve(y_test, y_prob)
+        ap = average_precision_score(y_test, y_prob)
+        pr_data[name] = (rec_arr, prec_arr, ap)
+
+        # ── Confusion matrix ──────────────────────────────────────────────
+        cm = confusion_matrix(y_test, y_pred)
+        fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax_cm,
+                    xticklabels=["TBI (pred)", "PD (pred)"],
+                    yticklabels=["TBI (true)", "PD (true)"])
+        ax_cm.set_title(f"Confusion Matrix – {name} ({split_label})")
+        plt.tight_layout()
+        fig_cm.savefig(
+            os.path.join(OUT, f"plot_cm_{name.replace(' ','_').lower()}_{tag}.png"),
+            dpi=150,
+        )
+        plt.close(fig_cm)
+
+    all_results[split_label] = split_results
+
+    # ── ROC Curves — all models on one graph ─────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for (name, (fpr, tpr, auc_val)), col in zip(roc_data.items(), COLORS_ML):
+        ax.plot(fpr, tpr, color=col, linewidth=2,
+                label=f"{name} (AUC = {auc_val:.3f})")
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random")
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate",  fontsize=12)
+    ax.set_title(f"ROC Curves — {split_label} Group Split",
+                 fontsize=14, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=9)
     plt.tight_layout()
-    fig_cm.savefig(os.path.join(OUT, f"plot_cm_{name.replace(' ','_').lower()}.png"), dpi=150)
-    plt.close(fig_cm)
+    fig.savefig(os.path.join(OUT, f"plot_roc_curves_{tag}.png"), dpi=200)
+    plt.close(fig)
 
-# finalise ROC
-roc_ax.plot([0,1],[0,1], "k--", linewidth=1)
-roc_ax.set_xlabel("False Positive Rate"); roc_ax.set_ylabel("True Positive Rate")
-roc_ax.set_title("ROC Curves – All Models (OOF 10-fold CV)")
-roc_ax.legend(loc="lower right"); roc_fig.tight_layout()
-roc_fig.savefig(os.path.join(OUT, "plot_roc_curves.png"), dpi=150)
-plt.close(roc_fig)
+    # ── Precision-Recall Curves — all models on one graph ────────────────
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for (name, (rec_arr, prec_arr, ap)), col in zip(pr_data.items(), COLORS_ML):
+        ax.plot(rec_arr, prec_arr, color=col, linewidth=2,
+                label=f"{name} (AP = {ap:.3f})")
+    ax.set_xlabel("Recall",    fontsize=12)
+    ax.set_ylabel("Precision", fontsize=12)
+    ax.set_title(f"Precision-Recall Curves — {split_label} Group Split",
+                 fontsize=14, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=9)
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUT, f"plot_pr_curves_{tag}.png"), dpi=200)
+    plt.close(fig)
 
-# finalise PR
-pr_ax.set_xlabel("Recall"); pr_ax.set_ylabel("Precision")
-pr_ax.set_title("Precision-Recall Curves – All Models (OOF 10-fold CV)")
-pr_ax.legend(loc="lower left"); pr_fig.tight_layout()
-pr_fig.savefig(os.path.join(OUT, "plot_pr_curves.png"), dpi=150)
-plt.close(pr_fig)
-print("  Saved: ROC, PR, and confusion matrix plots")
+    # ── Random Forest feature importance — top 10 ─────────────────────────
+    rf_pipeline = models["Random Forest"]
+    importances = rf_pipeline.named_steps["clf"].feature_importances_
+    feat_imp_df = (
+        pd.DataFrame({"feature": FEATURE_COLS, "importance": importances})
+        .sort_values("importance", ascending=False)
+        .head(10)
+    )
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(feat_imp_df["feature"][::-1], feat_imp_df["importance"][::-1],
+            color="#2a9d8f")
+    ax.set_xlabel("Mean Decrease in Impurity", fontsize=12)
+    ax.set_title(f"Random Forest — Top 10 Features ({split_label} Split)",
+                 fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUT, f"plot_rf_feature_importance_{tag}.png"), dpi=200)
+    plt.close(fig)
 
-# ── Feature Importance – Random Forest ───────────────────────────────────
-print("  Computing Random Forest feature importances …")
-rf_full = Pipeline([
-    ("scaler", StandardScaler()),
-    ("clf", RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)),
-])
-rf_full.fit(X, y)
-importances = rf_full.named_steps["clf"].feature_importances_
-feat_imp_df = pd.DataFrame({"feature": FEATURE_COLS, "importance": importances})
-feat_imp_df = feat_imp_df.sort_values("importance", ascending=False)
-top10_rf = feat_imp_df.head(10)
+    print(f"  Saved: ROC, PR, RF feature importance, and confusion matrix "
+          f"plots for {split_label}")
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+# ─────────────────────────────────────────────────────────────────────────────
+# Comparison Leaderboard
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n── Comparison Leaderboard ──")
 
-# RF top-10
-axes[0].barh(top10_rf["feature"][::-1], top10_rf["importance"][::-1], color="#2a9d8f")
-axes[0].set_xlabel("Mean Decrease in Impurity")
-axes[0].set_title("Top-10 Features – Random Forest")
+lb_rows = []
+for split_label, split_results in all_results.items():
+    for model_name, metrics in split_results.items():
+        lb_rows.append({"Split": split_label, "Model": model_name, **metrics})
 
-# Statistical top-10
-top10_stat = sig_0005.head(10) if len(sig_0005) >= 10 else sig_001.head(10)
-top10_stat = top10_stat.copy()
-top10_stat["-log10(p)"] = -np.log10(top10_stat["p_value"].clip(lower=1e-300))
-axes[1].barh(top10_stat["feature"][::-1].values,
-             top10_stat["-log10(p)"][::-1].values, color="#e9c46a")
-axes[1].set_xlabel("-log₁₀(p-value)")
-axes[1].set_title("Top-10 Features – Statistical (p-value)")
+lb_df = (
+    pd.DataFrame(lb_rows)
+    .sort_values(["Split", "AUC-ROC"], ascending=[True, False])
+    .reset_index(drop=True)
+)
+print(lb_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+lb_df.to_csv(os.path.join(OUT, "leaderboard.csv"), index=False)
 
-plt.suptitle("Feature Importance Comparison: Random Forest vs. Statistical Test", fontweight="bold")
+# ── Leaderboard table PNG ─────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 1 + len(lb_df) * 0.55))
+ax.axis("off")
+tbl = ax.table(
+    cellText=lb_df.round(4).values,
+    colLabels=lb_df.columns.tolist(),
+    cellLoc="center",
+    loc="center",
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(9)
+tbl.scale(1, 1.5)
+for col_idx in range(len(lb_df.columns)):
+    tbl[0, col_idx].set_facecolor("#2c7bb6")
+    tbl[0, col_idx].set_text_props(color="white", fontweight="bold")
+for row_idx in range(1, len(lb_df) + 1):
+    bg = "#f0f8ff" if row_idx % 2 == 0 else "white"
+    for col_idx in range(len(lb_df.columns)):
+        tbl[row_idx, col_idx].set_facecolor(bg)
+ax.set_title("Model Comparison Leaderboard (Group-Based Splits: 70:30 & 80:20)",
+             fontsize=13, fontweight="bold", pad=12)
 plt.tight_layout()
-fig.savefig(os.path.join(OUT, "plot_feature_importance_comparison.png"), dpi=150)
+fig.savefig(os.path.join(OUT, "plot_leaderboard.png"), dpi=200, bbox_inches="tight")
 plt.close(fig)
-print("  Saved: plot_feature_importance_comparison.png")
-
-# ── Overlap analysis ─────────────────────────────────────────────────────
-rf_top10_set   = set(top10_rf["feature"].tolist())
-stat_top10_set = set(top10_stat["feature"].tolist())
-overlap = rf_top10_set & stat_top10_set
-print(f"\n  Overlap between RF top-10 and statistical top-10: {len(overlap)} features")
-if overlap:
-    print(f"    {', '.join(sorted(overlap))}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Leaderboard
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── Leaderboard ──")
-lb_df = pd.DataFrame(leaderboard_rows)
-lb_display = lb_df[["Model","Accuracy","Precision","Recall","F1-Score","ROC-AUC"]].copy()
-lb_display = lb_display.sort_values("ROC-AUC", key=lambda s: lb_df["_auc"], ascending=False)
-print(lb_display.to_string(index=False))
-
-lb_display.to_csv(os.path.join(OUT, "leaderboard.csv"), index=False)
-print("\n  Saved: leaderboard.csv")
 
 # ── Leaderboard heatmap ───────────────────────────────────────────────────
-lb_numeric = lb_df[["Model","_acc","_f1","_auc"]].set_index("Model")
-lb_numeric.columns = ["Accuracy","F1-Score","ROC-AUC"]
-lb_numeric = lb_numeric.sort_values("ROC-AUC", ascending=False)
-
-fig, ax = plt.subplots(figsize=(8, 4))
-sns.heatmap(lb_numeric, annot=True, fmt=".3f", cmap="YlGn", ax=ax,
+pivot = lb_df.set_index(["Model", "Split"])[
+    ["Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"]
+]
+fig, ax = plt.subplots(figsize=(10, max(4, len(pivot) * 0.55)))
+sns.heatmap(pivot, annot=True, fmt=".3f", cmap="YlGn", ax=ax,
             vmin=0.5, vmax=1.0, linewidths=0.5, cbar_kws={"label": "Score"})
-ax.set_title("Model Leaderboard  (10-fold Stratified CV)", fontsize=13, fontweight="bold")
+ax.set_title("Model Comparison Heatmap (70:30 & 80:20 Group Splits)",
+             fontsize=13, fontweight="bold")
 ax.set_ylabel("")
 plt.tight_layout()
-fig.savefig(os.path.join(OUT, "plot_leaderboard_heatmap.png"), dpi=150)
+fig.savefig(os.path.join(OUT, "plot_leaderboard_heatmap.png"), dpi=200)
 plt.close(fig)
-print("  Saved: plot_leaderboard_heatmap.png")
+
+print("\n  Saved: leaderboard.csv, plot_leaderboard.png, plot_leaderboard_heatmap.png")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
