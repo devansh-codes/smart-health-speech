@@ -57,25 +57,83 @@ warnings.filterwarnings("ignore")
 # =============================================================
 # CELL 3: LOAD & PREPROCESS DATA
 # =============================================================
+
+# Metadata columns that are never used as model features
+_META_COLS = {"label", "patient_id", "file_name", "date", "time", "audio_path", "composite_key"}
+
+
+def _log_attrition(df_raw):
+    """
+    Find patients missing from one category and log attrition details.
+
+    Returns the filtered DataFrame (only patients present in both PD and TBI).
+    """
+    pd_patients = set(df_raw.loc[df_raw["label"] == "PD", "patient_id"].unique())
+    tbi_patients = set(df_raw.loc[df_raw["label"] == "TBI", "patient_id"].unique())
+
+    valid_patients = pd_patients & tbi_patients
+    pd_only = sorted(pd_patients - tbi_patients)
+    tbi_only = sorted(tbi_patients - pd_patients)
+    total_dropped = len(pd_only) + len(tbi_only)
+
+    print("=" * 70)
+    print("ATTRITION REPORT")
+    print("=" * 70)
+    print(f"  PD  patients total  : {len(pd_patients)}")
+    print(f"  TBI patients total  : {len(tbi_patients)}")
+    print(f"  Kept (in both)      : {len(valid_patients)}")
+    print(f"  Dropped (PD-only)   : {len(pd_only)}")
+    print(f"  Dropped (TBI-only)  : {len(tbi_only)}")
+    print(f"  Total patients dropped: {total_dropped}")
+
+    if pd_only:
+        print(f"\n  PD-only patient IDs ({len(pd_only)}):")
+        print(f"    {pd_only}")
+    if tbi_only:
+        print(f"\n  TBI-only patient IDs ({len(tbi_only)}):")
+        print(f"    {tbi_only}")
+    print("=" * 70)
+
+    df_filtered = df_raw[df_raw["patient_id"].isin(valid_patients)].copy()
+    dropped_rows = len(df_raw) - len(df_filtered)
+    print(f"  Rows before filter : {len(df_raw)}")
+    print(f"  Rows after filter  : {len(df_filtered)}  ({dropped_rows} rows removed)")
+    print("=" * 70 + "\n")
+
+    return df_filtered
+
+
 def load_and_preprocess(csv_path):
     """
-    Load feature CSV and prepare for training.
+    Load merged PD+TBI feature CSV and prepare for training.
 
     Steps:
         1. Load CSV
-        2. Separate features from labels
-        3. Handle NaN/Inf values
-        4. Encode labels (PD=1, TBI=0)
-        5. Scale features
+        2. Create composite_key (patient_id + date + time)
+        3. Intersect patient_ids — drop patients missing from either category
+        4. Log attrition (dropped patient IDs, per-category counts, total)
+        5. Separate features from labels
+        6. Handle NaN/Inf values
+        7. Encode labels (PD=1, TBI=0)
+        8. Scale features
 
     Returns:
         X_scaled, y, feature_names, scaler, label_encoder
     """
     df = pd.read_csv(csv_path)
 
-    # Drop non-feature columns
-    drop_cols = ["filename", "label"]
-    feature_cols = [c for c in df.columns if c not in drop_cols]
+    # Create composite key
+    df["composite_key"] = (
+        df["patient_id"].astype(str) + "_"
+        + df["date"].astype(str) + "_"
+        + df["time"].astype(str)
+    )
+
+    # Intersection filter + attrition log
+    df = _log_attrition(df)
+
+    # Drop all metadata columns; keep only numeric feature columns
+    feature_cols = [c for c in df.columns if c not in _META_COLS]
 
     X = df[feature_cols].copy()
     y_raw = df["label"].copy()
@@ -112,8 +170,13 @@ def analyze_features(csv_path, top_n=15):
         - Bar chart of top features
     """
     df = pd.read_csv(csv_path)
-    drop_cols = ["filename", "label"]
-    feature_cols = [c for c in df.columns if c not in drop_cols]
+    df["composite_key"] = (
+        df["patient_id"].astype(str) + "_"
+        + df["date"].astype(str) + "_"
+        + df["time"].astype(str)
+    )
+    df = _log_attrition(df)
+    feature_cols = [c for c in df.columns if c not in _META_COLS]
 
     # Group statistics
     print("=" * 70)
@@ -347,15 +410,11 @@ def train_and_evaluate(X, y, feature_names, scaler, le, output_dir="."):
 # CELL 6: MAIN - RUN FULL PIPELINE
 # =============================================================
 if __name__ == "__main__":
-    CSV_PATH = "features.csv"
+    CSV_PATH = "../features 1.csv"  # merged PD+TBI file (one level up from smart-health-speech/)
 
     if not os.path.exists(CSV_PATH):
         print(f"Features CSV not found at: {CSV_PATH}")
-        print("Run feature_extraction_enhanced.py first to generate features.")
-        print("\nExample:")
-        print("  from feature_extraction_enhanced import process_all_files")
-        print('  df = process_all_files("path/to/PD", "path/to/TBI")')
-        print('  df.to_csv("features.csv", index=False)')
+        print("Expected the merged PD+TBI features file at that path.")
         exit(1)
 
     # Step 1: Load & preprocess
