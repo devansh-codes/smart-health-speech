@@ -35,7 +35,7 @@ from sklearn.model_selection import (
     cross_val_score,
     train_test_split,
 )
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
@@ -61,46 +61,30 @@ warnings.filterwarnings("ignore")
 # Metadata columns that are never used as model features
 _META_COLS = {"label", "patient_id", "file_name", "date", "time", "audio_path", "composite_key"}
 
+# Explicit label mapping: TBI=1, PD=2
+_LABEL_MAP = {"TBI": 1, "PD": 2}
 
-def _log_attrition(df_raw):
-    """
-    Find patients missing from one category and log attrition details.
 
-    Returns the filtered DataFrame (only patients present in both PD and TBI).
-    """
-    pd_patients = set(df_raw.loc[df_raw["label"] == "PD", "patient_id"].unique())
-    tbi_patients = set(df_raw.loc[df_raw["label"] == "TBI", "patient_id"].unique())
+class _Encoder:
+    """Explicit label encoder — TBI=1, PD=2."""
+    classes_ = np.array(["TBI", "PD"])  # ordered by assigned value
 
-    valid_patients = pd_patients & tbi_patients
-    pd_only = sorted(pd_patients - tbi_patients)
-    tbi_only = sorted(tbi_patients - pd_patients)
-    total_dropped = len(pd_only) + len(tbi_only)
+    def transform(self, labels):
+        return np.array([_LABEL_MAP[l] for l in labels])
 
+
+def _log_dataset_summary(df):
+    """Print a row/patient count summary by label (no filtering)."""
     print("=" * 70)
-    print("ATTRITION REPORT")
+    print("DATASET SUMMARY")
     print("=" * 70)
-    print(f"  PD  patients total  : {len(pd_patients)}")
-    print(f"  TBI patients total  : {len(tbi_patients)}")
-    print(f"  Kept (in both)      : {len(valid_patients)}")
-    print(f"  Dropped (PD-only)   : {len(pd_only)}")
-    print(f"  Dropped (TBI-only)  : {len(tbi_only)}")
-    print(f"  Total patients dropped: {total_dropped}")
-
-    if pd_only:
-        print(f"\n  PD-only patient IDs ({len(pd_only)}):")
-        print(f"    {pd_only}")
-    if tbi_only:
-        print(f"\n  TBI-only patient IDs ({len(tbi_only)}):")
-        print(f"    {tbi_only}")
-    print("=" * 70)
-
-    df_filtered = df_raw[df_raw["patient_id"].isin(valid_patients)].copy()
-    dropped_rows = len(df_raw) - len(df_filtered)
-    print(f"  Rows before filter : {len(df_raw)}")
-    print(f"  Rows after filter  : {len(df_filtered)}  ({dropped_rows} rows removed)")
+    for label in ("PD", "TBI"):
+        subset = df[df["label"] == label]
+        n_patients = subset["patient_id"].nunique()
+        n_rows = len(subset)
+        print(f"  {label}: {n_patients} unique patients, {n_rows} rows")
+    print(f"  Total rows: {len(df)}")
     print("=" * 70 + "\n")
-
-    return df_filtered
 
 
 def load_and_preprocess(csv_path):
@@ -110,15 +94,14 @@ def load_and_preprocess(csv_path):
     Steps:
         1. Load CSV
         2. Create composite_key (patient_id + date + time)
-        3. Intersect patient_ids — drop patients missing from either category
-        4. Log attrition (dropped patient IDs, per-category counts, total)
-        5. Separate features from labels
-        6. Handle NaN/Inf values
-        7. Encode labels (PD=1, TBI=0)
-        8. Scale features
+        3. Print dataset summary by label
+        4. Separate features from labels
+        5. Handle NaN/Inf values
+        6. Encode labels (TBI=1, PD=2)
+        7. Scale features
 
     Returns:
-        X_scaled, y, feature_names, scaler, label_encoder
+        X_scaled, y, feature_names, scaler, encoder
     """
     df = pd.read_csv(csv_path)
 
@@ -129,8 +112,7 @@ def load_and_preprocess(csv_path):
         + df["time"].astype(str)
     )
 
-    # Intersection filter + attrition log
-    df = _log_attrition(df)
+    _log_dataset_summary(df)
 
     # Drop all metadata columns; keep only numeric feature columns
     feature_cols = [c for c in df.columns if c not in _META_COLS]
@@ -142,17 +124,18 @@ def load_and_preprocess(csv_path):
     X = X.replace([np.inf, -np.inf], np.nan)
     X = X.fillna(X.median())
 
-    # Encode labels
-    le = LabelEncoder()
-    y = le.fit_transform(y_raw)  # PD=1, TBI=0 (alphabetical)
-    print(f"Label encoding: {dict(zip(le.classes_, le.transform(le.classes_)))}")
+    # Encode labels explicitly: TBI=1, PD=2
+    le = _Encoder()
+    y = le.transform(y_raw)
+    print(f"Label encoding: {_LABEL_MAP}")
 
     # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     print(f"Dataset: {X_scaled.shape[0]} samples, {X_scaled.shape[1]} features")
-    print(f"Class distribution: {dict(zip(le.classes_, np.bincount(y)))}")
+    unique, counts = np.unique(y, return_counts=True)
+    print(f"Class distribution: {dict(zip(unique, counts))}")
 
     return X_scaled, y, feature_cols, scaler, le
 
@@ -175,7 +158,7 @@ def analyze_features(csv_path, top_n=15):
         + df["date"].astype(str) + "_"
         + df["time"].astype(str)
     )
-    df = _log_attrition(df)
+    _log_dataset_summary(df)
     feature_cols = [c for c in df.columns if c not in _META_COLS]
 
     # Group statistics
@@ -196,8 +179,7 @@ def analyze_features(csv_path, top_n=15):
 
     # Feature ranking using ANOVA F-statistic
     X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(df[feature_cols].median())
-    le = LabelEncoder()
-    y = le.fit_transform(df["label"])
+    y = _Encoder().transform(df["label"])
 
     selector = SelectKBest(f_classif, k=min(top_n, len(feature_cols)))
     selector.fit(X, y)
